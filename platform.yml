@@ -1,0 +1,800 @@
+---
+- name: Installing platform
+  hosts: rockstat
+  become: yes
+  tasks:
+
+    - debug:
+        msg: 
+          email: "{{_email}}"
+          realname: "{{_fullname}}"
+          domain: "{{_domain}}"
+          admin_password: "{{_admin_password}}"
+          enable_support: "{{_enable_support}}"
+          ssl_wildcard: "{{_ssl_wildcard}}"
+      tags: ['never']
+
+
+      #### ##### ##### ##### #####    Check is python 3    ##### ##### ##### ##### ##### 
+
+    - name: Checking python version is 3
+      assert:
+        that: 
+          - "ansible_python_interpreter == '/usr/bin/python3'"
+        msg: "Required python 3. Details: https://docs.ansible.com/ansible/latest/reference_appendices/python_3_support.html"
+      tags: ["always"]
+
+    - name: Build and set permissions for required dirs
+      block:
+      - name: Creating directories
+        command: "mkdir -p {{ block_dirs }}"
+        args:
+          warn: False
+
+      - name: Setting permissions
+        command: "chown {{_uid}}:{{_gid}} {{ block_dirs }}"
+        args:
+          warn: False
+
+      vars:
+        block_dirs: "{{ create_dirs|flatten|join(' ') }}"
+      tags: ["never", "full", "platform", "dirs"]
+
+
+      ##### ##### ##### ##### #####    Checking system reqs    ##### ##### ##### ##### ##### 
+    - block:
+      - name: Checking server total mem
+        assert:
+          that:
+            - ansible_memtotal_mb >= 4000
+          msg: "Required mem >= 4GB"
+
+      - debug: var=msg
+            
+      vars:
+        msg:
+          memtotal_mb: "{{ansible_memtotal_mb}}"
+          clickhouse_memory_limit: "{{mem_limit_clickhouse}}"
+          redis_memory_limit: "{{mem_limit_redis}}"
+          jupyter_memory_limit: "{{mem_limit_jupyter}}"
+      tags: ['always']
+
+      ##### ##### ##### ##### #####    Server configuration    ##### ##### ##### ##### ##### 
+      
+    - block:
+      - name: BaseServer role execution
+        include_role:
+          name: dr.server
+        vars:
+          drs_setup_user: yes
+          drs_user: '{{support_user}}'
+          drs_home_dir: "{{home_dir}}"
+          drs_pub_key_file: '{{support_key_file}}'
+          drs_disable_ipv6: "{{disable_ipv6}}"
+          drs_extra_hosts: "{{etc_hosts}}"
+          drs_uid: "{{_gid}}"
+          drs_gid: "{{_uid}}"
+          r_authorized_key_remove: "{{ not _enable_support }}"
+      when: 'setup_server == True'
+      tags: ['never', 'os', 'network', 'system', 'full']
+
+      ##### ##### ##### ##### #####    Check DNS configuration    ##### ##### ##### ##### ##### 
+      # Should be after server configuration role that ensure dns utils is installed
+
+    - block:
+        - include_tasks: tasks/check_dns.yml
+      vars:
+        check_domains: "{{_domains + [_domain]}}"
+      tags: ['never', 'ssl', 'full']
+
+      
+
+
+    ##### ##### ##### ##### #####    Docker server     ##### ##### ##### ##### ##### 
+
+    - block:
+      - name: Docker role execution
+        include_role:
+          name: dr.docker
+        vars: 
+          drd_users:
+          - "{{support_user}}"
+          drd_create_network: yes
+          drd_version: edge
+          drd_net_name: '{{docker_net_name}}'
+          drd_bind_ip: "{{docker_host_ip}}"
+          drd_interface: '{{docker_interface}}'
+          drd_net: '{{docker_net}}'
+          drd_mtu: '1400'
+      tags: ['never', 'system', 'docker', 'full']
+
+
+    ##### ##### ##### ##### #####    Dashboard    ##### ##### ##### ##### ##### 
+
+    - name: Cloning Dashboard content
+      git:
+        repo: '{{repos.dashboard}}'
+        version: HEAD
+        force: yes
+        accept_hostkey: yes
+        dest: '{{dirs.dashboard}}'
+      tags: ['dashboard', 'platform', 'ppart', 'band', 'static', 'full']
+
+
+    ##### ##### ##### ##### #####    Splash screen    ##### ##### ##### ##### ##### 
+
+    # - block:
+    #   - name: Cloning Splash content
+    #     git:
+    #       repo: "{{repos.splash}}"
+    #       dest: "{{dirs.splash}}"
+    #       accept_hostkey: yes
+    #       force: yes
+        
+    #   - template:
+    #       src: google-webmaster.j2
+    #       dest: "{{dirs.splash}}/{{_google_webmaster}}"
+    #     when: "_google_webmaster is defined and _google_webmaster != ''"
+      
+    #   tags: ['splash', 'platform', 'ppart', 'band', 'static', 'full']
+
+
+    ##### ##### ##### ##### #####    Exposeur (UFW, iptables)    ##### ##### ##### ##### ##### 
+
+    - block:
+      - name: Exposeur role execution
+        include_role:
+          name: dr.exposeur
+        vars:
+          expo_reset_ufw: true
+          expo_rules: '{{firewall_rules|flatten + host_firewall_rules|default([]) + group_firewall_rules|default([])}}'
+          expo_expose_rules: '{{expose_rules|default([]) + host_expose_rules|default([]) + group_expose_rules|default([])}}'
+      tags: ['never', 'firewall', 'network', 'system', 'full']
+
+    ##### ##### ##### ##### #####    Lets encrypt - acme.sh    ##### ##### ##### ##### ##### 
+
+
+
+
+    # - block:
+        # - name: LetsEncrypt role execution
+        #   include_role:
+        #     name: dr.letsencrypt.wildcard.auto
+        #   vars:
+        #     _r_domain: "{{_domain}}"
+        #     _r_subdomains: "{{_subdomains}}"
+        #     _r_webroot: "{{dirs.well_known}}"
+        #     _r_force: "{{ssl_force|default(False)|bool}}"
+        #     _r_wildcard: "{{_ssl_wildcard}}"
+        #     _r_docker_networks: [ { name: "{{docker_net_name}}" } ]
+        #     _r_docker_labels: "{{ {}|combine(labels, docker_band_lbls) }}"
+        #     _r_check_addr: "{{if_inner}}:{{ports.http.0}}"
+        #     _r_bind_addr: "{{if_inner}}:{{ports.letsencrypt.0}}"
+        #     _r_cert_root: "{{dirs.certs}}"
+        #     _r_dns_provider: "{{_ssl_dns_provider|default('dns_acmedns')}}" 
+        #     _r_dns_envs: "{{_ssl_dns_envs|default({})}}"
+        #     _r_debug: yes
+        #     _r_log: no
+
+      #   - shell: nginx -t && nginx -s reload || /bin/true
+
+      # vars:
+      #   oldloc: "/etc/letsencrypt/live/{{_domain}}"
+      #   labels:
+      #     band.service.title: "SSL Renewer"
+    #   #     band.service.def_position: "0x6"
+
+
+    #   when: "_setup_ssl == True"
+    #   tags: ['never', 'full', 'system', 'ssl']
+
+    ##### ##### ##### ##### #####    Caddy    ##### ##### ##### ##### ##### 
+
+
+    - block:
+      - name: disable service nginx on debian, if running
+        systemd:
+          name: nginx
+          state: stopped
+          enabled: no
+          masked: yes
+        failed_when: False
+        when: ansible_service_mgr == 'systemd'
+
+      - name: Removing old renew daemon if present
+        docker_container:
+          name: acmesh-daemon
+          state: absent
+
+      - name: 'Creating build directory for caddy image'
+        file:
+          state: directory
+          path: "{{caddy_build_dir}}"
+          owner: "{{_uid|string}}"
+          group: "{{_gid|string}}"
+
+      - name: 'Templating Facts'
+        template:
+          src: "templates/facts.d/config.fact.j2"
+          dest: "{{ local_facts_dir }}/jwt.fact"
+
+      - name: 'Templating Caddy configs'
+        template:
+          src: "{{item}}"
+          dest: "{{ caddy_build_dir }}/{{ (item|basename|splitext).0 }}"
+        with_fileglob: 'templates/caddy/*.j2'
+      
+      - name: 'Creating container'
+        docker_container:
+          name: caddy
+          hostname: caddy
+          image: "{{images.caddy}}"
+          # labels: "{{docker_band_lbls}}"
+          ports: 
+            - "0.0.0.0:{{ports.http.0}}:{{ports.http.0}}"
+            - "0.0.0.0:{{ports.https.0}}:{{ports.https.0}}"
+          networks: [ { name: "{{docker_net_name}}" } ]
+          etc_hosts: "{{etc_hosts}}"
+          restart_policy: "{{_restart_policy}}"
+          pull: yes
+          env: "{{container_env|combine(extra_env)}}"
+          restart: yes
+          recreate: yes
+          sysctls: "{{docker_sysctls}}"
+          log_options: "{{ docker_log_options }}"
+          log_driver: "{{ docker_log_driver }}"
+          memory: "500m"
+          volumes:
+            - "{{caddy_build_dir}}/Caddyfile:/etc/caddy/Caddyfile:ro"
+            - "{{caddy_build_dir}}/htpasswd:/etc/caddy/htpasswd:ro"
+            - "{{dirs.public}}:/wwwroot/public:ro"
+            - "{{dirs.dashboard}}/dist:/dashboard:ro"
+            - /var/run/docker.sock:/var/run/docker.sock
+            - "{{dirs.certs}}/.caddy:/root/.caddy"
+            - "{{dirs.certs}}/bolt.rstat.org:/bolt.rstat.org:ro"
+      vars:
+        service: caddy
+        s_jwt_config: "{{(ansible_local.jwt|default({})).general|default({}) }}"
+        s_jwt_secret: "{{ jwt_secret|default(s_jwt_config.secret|default(64|token_urlsafe)) }}"
+        _facts_dict: 
+          secret: "{{ s_jwt_secret }}"
+        extra_env:
+          ACME_AGREE: 'true'
+          ENABLE_TELEMETRY: 'false'
+          JWT_SECRET: "{{s_jwt_secret}}"
+        common_users:
+          - "admin:{{_admin_password}}"
+        caddy_build_dir: "{{build_dir}}/caddy"
+        tmpl:
+          email: "{{_email}}"
+          domain: "{{_domain}}"
+          extra_domains: "{{_extra_domains}}"
+          domains: "{{_domains}}"
+          http_to: "front:{{ports.front.1}}"
+          ws_to: "front:{{ports.front_ws.1}}"
+          director_to: "director:{{ports.director.1}}"
+          dns_provider: "{{dns_provider|default(None)}}"
+      tags: ['never', 'caddy', 'httpd', 'system', 'full']
+
+    # - block:
+    ##### ##### ##### ##### #####    Nginx    ##### ##### ##### ##### ##### 
+
+      # - include_vars: vars/nginx.yml
+      # - name: Nginx role execution
+      #   include_role:
+      #     name: jdauphant.nginx
+      #   vars:
+      #     nginx_official_repo: no
+      #     keep_only_specified: yes
+      #     nginx_http_params: '{{_nginx_http_params}}'
+      #     nginx_sites: "{{_nginx_sites|combine(_nginx_sites_extra|default({}))}}"
+      #     nginx_auth_basic_files:
+      #       common: "{{ common_users|flatten }}"
+      #     nginx_configs:
+      #       upgrade: '{{_nginx_proto_upgrade}}'
+      #       gzip: '{{_nginx_gzip_params}}'
+      #       proxy: '{{_nginx_proxy_params + _nginx_proxy_params_extra|default([])}}'
+      #       upstream: '{{_nginx_upstreams + _nginx_upstreams_extra|default([]) }}'
+      #       ssl: '{{_nginx_ssl_params}}'
+      # vars:
+      #   local_config: "{{ansible_local.config|default({})}}"
+      #   local_general: "{{local_config.general|default({})}}"
+        
+      #   common_users:
+      #     - "admin:{{_admin_password}}"
+      #     - "{{local_general.users}}"
+      # when: "setup_nginx == True"
+      # tags: ['never', 'nginx', 'httpd', 'system', 'full']
+
+
+    ##### ##### ##### ##### #####    Netdata    ##### ##### ##### ##### ##### 
+
+    - block:
+
+      - name: disabling netdata service
+        systemd:
+          state: stopped
+          daemon_reload: yes
+          enabled: no
+          masked: yes
+          name: netdata
+        when: ansible_service_mgr == 'systemd'
+        failed_when: False
+          
+      - name: Netdata container
+        docker_container:
+          name: netdata
+          hostname: netdata
+          image: "{{images.netdata}}"
+          labels: "{{container_lbls|combine(_caddy_container_lbls)}}" # docker_band_lbls, 
+          ports: 
+            - "{{if_inner}}:{{ports.netdata.0}}:{{ports.netdata.1}}"
+            - "{{if_inner}}:{{ports.statsd.0}}:{{ports.statsd.1}}/udp"
+          networks: [ { name: "{{docker_net_name}}" } ]
+          etc_hosts: "{{etc_hosts}}"
+          restart_policy: "{{_restart_policy}}"
+          pull: yes
+          env: "{{container_env}}"
+          restart: yes
+          # recreate: yes
+          memory: "200m"
+          sysctls: "{{docker_sysctls}}"
+          capabilities:
+            - SYS_PTRACE
+          security_opts:
+            - apparmor:unconfined
+          volumes:
+            - /proc:/host/proc:ro
+            - /sys:/host/sys:ro
+            - /var/run/docker.sock:/var/run/docker.sock
+
+      # - name: Netdata role execution
+      #   include_role:
+      #     name: dr.netdata
+      #   vars:
+      #     drn_action: remove
+      #     drn_allow:
+      #       dashboard_from: "*"
+      #       badges_from: "*"
+      #       conf_from: "*"
+      #       connections_from: "*"
+      #       streaming_from: "*"
+      #     drn_stream: '{{netdata_stream_config|default({})}}'
+      #     drn_backend: '{{netdata_backend_config|default({})}}'
+      #     drn_bind_to: "{{if_inner}}"
+      # vars:
+      #   service: netdata
+      #   container_lbls:
+      #     "caddy.address": "netdata.{{_domain}}"
+      #     "caddy.targetport": "{{ports.netdata.1}}"
+      #   container_env:
+      #     PGID: "999"
+      # tags: ['never', 'netdata', 'system', 'full']
+
+  
+
+    ##### ##### ##### ##### #####    Clickhouse    ##### ##### ##### ##### ##### 
+
+
+
+
+    - block:
+      - name: Disabling clickhouse systemd service
+        systemd:
+          name: clickhouse-server
+          state: stopped
+          enabled: no
+          masked: yes
+        failed_when: False
+        when: ansible_service_mgr == 'systemd'
+
+      - name: Starting ClickHouse container
+        docker_container:
+          name: clickhouse
+          hostname: clickhouse
+          image: "{{images.clickhouse}}"
+          # labels: "{{docker_band_lbls}}"
+          networks: [ { name: "{{docker_net_name}}" } ]
+          etc_hosts: "{{etc_hosts}}"
+          restart_policy: "{{_restart_policy}}"
+          ulimits:
+            - "nofile:262144:262144"
+          memory: "{{ mem_limit_clickhouse|default('2g') }}"
+          # restart: yes
+          # pull: yes
+          # recreate: yes
+          sysctls: "{{docker_sysctls}}"
+          ports: 
+            - "{{if_inner}}:{{ports.clickhouse.0}}:{{ports.clickhouse.1}}"
+            - "{{if_inner}}:{{ports.clickhouse_tcp.0}}:{{ports.clickhouse_tcp.1}}"
+          volumes:
+            - "{{dirs.clickhouse}}:/var/lib/clickhouse"
+            - "{{dirs.clickhouse_log}}:/var/log/clickhouse-server"
+            - "{{dirs.clickhouse_tmp}}:/var/lib/clickhouse/tmp"
+
+    # - block: 
+    #   - name: Executing ClickHouse setup role
+    #     include_role:
+    #       name: AlexeySetevoi.clickhouse
+    #     vars:
+    #       clickhouse_listen_host_default: ["127.0.0.1", "::1", "{{if_inner}}"]
+    #       clickhouse_networks_default: ["127.0.0.1", "::1", "{{docker_net}}"]
+    #       clickhouse_profiles_custom: "{{_clickhouse_profiles_custom}}"
+    #       clickhouse_users_custom: "{{_clickhouse_users_custom}}"
+    #       clickhouse_logger: "{{_clickhouse_logger}}"
+    #       clickhouse_dbs_custom: [ {name: '{{ch_db}}'} ]
+    #       clickhouse_path_data: "{{dirs.clickhouse}}"
+    #       clickhouse_path_tmp: "{{dirs.clickhouse_tmp}}"
+      tags: ['never', 'clickhouse', 'clickhouse-server', 'system', 'full']
+
+    ##### ##### ##### ##### #####    Redis server    ##### ##### ##### ##### ##### 
+
+    - name: Redis setup
+      block:
+      - name: Starting container for service Redis
+        docker_container:
+          name: redis
+          hostname: redis
+          image: "{{images.redis}}"
+          # labels: "{{docker_band_lbls}}"
+          networks: [ { name: "{{docker_net_name}}" } ]
+          etc_hosts: "{{etc_hosts}}"
+          restart_policy: "{{_restart_policy}}"
+          restart: yes
+          # pull: yes
+          # recreate: yes
+          memory: "{{ mem_limit_redis|default('500m') }}"
+          sysctls: "{{docker_sysctls}}"
+          ports: ["{{if_inner}}:{{ports.redis.0}}:{{ports.redis.1}}"]
+          volumes: ["{{dirs.redis}}:/data"]
+      tags: ['never', 'redis', 'system', 'docker-container', 'full']
+
+
+    ##### ##### ##### ##### #####    Band Director    ##### ##### ##### ##### ##### 
+
+    - name: Band director block
+      block:
+
+      - name: Pulling latest Band image
+        docker_image:
+          name: "{{images.band}}"
+          source: pull
+
+      - name: Git pulling BandSet
+        git:
+          repo: "{{repos.band_set}}"
+          dest: "{{dirs.band_set}}"
+          version: "{{branch}}"
+          accept_hostkey: yes
+          force: yes
+
+      - name: Building docker container with Director service
+        docker_container:
+          name: director
+          hostname: director
+          image: "{{ image }}"
+          labels: "{{docker_band_lbls}}"
+          ports: [ "{{if_inner}}:{{ports[service].0}}:{{ports[service].1}}" ]
+          networks: [ { name: "{{docker_net_name}}" } ]
+          etc_hosts: "{{etc_hosts}}"
+          env: "{{ container_env|combine({'ENCODED_ENV': container_env|to_json }) }}"
+          sysctls: "{{docker_sysctls}}"
+          restart_policy: "{{_restart_policy}}"
+          pull: yes
+          restart: yes
+          recreate: yes
+          memory: "300m"
+          volumes:
+            - "{{dirs.band_set}}:/images/band_set"
+            - "{{dirs.rockme_set}}:/images/rockme_set"
+            - "{{dirs.user_images}}:/images/user"
+            - "{{dirs.director_data}}:/data" # containers configs
+            - "{{dirs.environments}}:/data/environments"
+            - "{{dirs.etc_dir}}:/srv/platform/etc"
+            - "/var/run/docker.sock:/var/run/docker.sock"
+      vars:
+        service: director
+        image: "{{ images[service] }}"
+      tags: ['band', 'platform', 'ppart', 'director', 'docker-container', 'full']
+
+    ##### ##### ##### ##### #####    Front    ##### ##### ##### ##### ##### 
+
+    - block:
+      - docker_container: name=frontier state=absent
+
+      - name: Starting container with Front service
+        docker_container:
+          name: front
+          hostname: front
+          image: "{{ images.front }}"
+          labels: "{{ docker_band_lbls }}"
+          ports: 
+            - "{{if_inner}}:{{ports.front.0}}:{{ports.front.1}}"
+            - "{{if_inner}}:{{ports.front_ws.0}}:{{ports.front_ws.1}}"
+          networks: [ { name: "{{docker_net_name}}" } ]
+          etc_hosts: "{{etc_hosts}}"
+          env: "{{container_env}}"
+          sysctls: "{{docker_sysctls}}"
+          restart_policy: "{{_restart_policy}}"
+          pull: yes
+          restart: yes
+          recreate: yes
+          memory: "300m"
+          volumes:
+            - "{{dirs.front_custom_config}}:/app/config/custom"
+
+      vars:
+        service: "front"
+      tags: ['front', 'platform', 'ppart', 'rockme', 'docker-container', 'full']
+
+
+    ##### ##### ##### ##### #####    ClickHouse migrations    ##### ##### ##### ##### ##### 
+    # - name: Including ClickHouse maintain role
+    #   block:
+    #   - import_tasks: tasks/ch_migrate.yml
+    #     vars:
+    #       operate_db: "{{ch_db}}"
+    #       operate_host: "127.0.0.1"
+    #       migrations_path: clickhouse_migrations
+    #   tags: ['never', 'chmigrate']
+
+        ##### ##### ##### ##### #####    Clickhouse Proxy    ##### ##### ##### ##### ##### 
+
+    - block:
+
+      - name: Rendering CHProxy config
+        template:
+          src: 'chproxy/config.yml.j2'
+          dest: '{{chproxy_config}}'
+
+      - name: Starting container with Chproxy service
+        docker_container:
+          name: chproxy
+          hostname: chproxy
+          image: "{{images.chproxy}}"
+          labels: "{{container_lbls|combine(docker_band_lbls)}}"
+          networks: [ { name: "{{docker_net_name}}" } ]
+          etc_hosts: "{{etc_hosts}}"
+          sysctls: "{{docker_sysctls}}"
+          restart_policy: "{{_restart_policy}}"
+          restart: yes
+          pull: yes
+          recreate: yes
+          memory: "200m"
+          ports: ["{{if_inner}}:{{ports.chproxy.0}}:{{ports.chproxy.1}}"]
+          volumes: ["{{chproxy_config}}:/config.yml:ro"]
+      vars:
+        chproxy_config: "{{etc_dir}}/chproxy.yml"
+        chproxy_defs: "{{_chproxy_defs}}"
+        chproxy_allowed_networks: "{{_chproxy_allowed_networks_default + _chproxy_allowed_networks|default([])}}"
+        chproxy_clusters: "{{_chproxy_clusters_default + _chproxy_clusters|default([])}}"
+        chproxy_users: "{{_chproxy_users_default + _chproxy_users|default([])}}"
+        container_lbls:
+          "caddy.address": "chproxy.{{_domain}}"
+          "caddy.targetport": "{{ports.chproxy.1}}"
+      tags: ['never', 'clickhouse-proxy', 'chproxy', 'platform', 'pservice', 'docker-container', 'full']
+
+
+    ##### ##### ##### ##### #####    ClickHouse Writer    ##### ##### ##### ##### ##### 
+
+    - block:
+      - name: Starting container with ChWriter service
+        docker_container:
+          name: chwriter
+          hostname: chwriter
+          image: "{{images.chwriter}}"
+          labels: "{{docker_band_lbls}}"
+          networks: [ { name: "{{docker_net_name}}" } ]
+          etc_hosts: "{{etc_hosts}}"
+          env: "{{container_env}}"
+          sysctls: "{{docker_sysctls}}"
+          restart_policy: "{{_restart_policy}}"
+          pull: yes
+          restart: yes
+          recreate: yes
+          memory: "300m"
+          volumes:
+            - "{{dirs.chwriter_custom_config}}:/app/config/custom"
+            - "{{dirs.chwriter_custom_migrations}}:/app/migrations/custom"
+            - "{{dirs.chwriter_emergency}}:/app/emergency"
+      vars:
+        service: chwriter
+      tags: ['chwriter', 'platform', 'ppart', 'rockme', 'docker-container', 'full']
+
+    ##### ##### ##### ##### #####    Heavyload    ##### ##### ##### ##### ##### 
+
+    - block:
+      - name: Starting container with Heavyload service
+        docker_container:
+          name: heavyload
+          hostname: heavyload
+          image: "{{images.heavyload}}"
+          labels: "{{docker_band_lbls}}"
+          networks: [ { name: "{{docker_net_name}}" } ]
+          etc_hosts: "{{etc_hosts}}"
+          env: "{{container_env}}"
+          sysctls: "{{docker_sysctls}}"
+          restart_policy: "{{_restart_policy}}"
+          pull: yes
+          restart: yes
+          memory: "500m"
+          volumes:
+            - "{{dirs.uploads}}:/go/src/heavyload/upload"
+          ports:
+            - "{{if_inner}}:{{ports.heavyload.0}}:{{ports.heavyload.1}}"
+      vars:
+        service: heavyload
+      tags: ['heavyload', 'platform', 'pservice', 'docker-container', 'full']
+
+    ##### ##### ##### ##### #####    jupyter    ##### ##### ##### ##### ##### 
+    - block:
+      - docker_container:
+          name: anaconda
+          state: absent
+
+      - name: Starting container for service Jupyter
+        docker_container:
+          name: jupyter
+          hostname: jupyter
+          image: "{{image}}"
+          labels: "{{container_lbls|combine(docker_band_lbls, _caddy_container_lbls)}}"
+          networks: [ { name: "{{docker_net_name}}" } ]
+          etc_hosts: "{{etc_hosts}}"
+          restart_policy: "{{_restart_policy}}"
+          pull: "{{ '/' in  image}}"
+          recreate: yes
+          memory: "{{ mem_limit_jupyter|default('2g') }}"
+          volumes:
+            - "{{dirs.notebooks}}:{{nb_dir}}:cached"
+            - "{{dirs.public}}:{{nb_dir}}/public:cached"
+            - "{{dirs.shared}}:{{nb_dir}}/shared:cached"
+          ports: [ "{{if_inner}}:{{ports.jupyter.0}}:{{ports.jupyter.1}}" ]
+          env: "{{ container_env }}"
+          sysctls: "{{docker_sysctls}}"
+
+      - name: Fix notebooks permissions
+        command: "chown -R {{_uid}}:{{_gid}} {{dirs.notebooks}}"
+        args:
+          warn: False
+
+      vars:
+        service: jupyter
+        image: "{{ images[service] }}"
+        nb_dir: "{{jupyter_notebooks_dir|default('/home/user/notebooks')}}"
+        cmd_parts:
+        # labels: "{{container_lbls|combine(docker_band_lbls, _caddy_container_lbls)}}"
+        container_lbls:
+          "caddy.address": "jupyter.{{_domain}}"
+          "caddy.targetport": "{{ports.jupyter.1}}"
+      when: 'setup_jupyter == True'
+      tags: ['never', 'jupyter', 'jupyter', 'platform', 'pservice', 'docker-container', 'full']
+
+
+    ##### ##### ##### ##### #####    Grafana    ##### ##### ##### ##### ##### 
+    - block:
+      - name: Creating Grafana datadir
+        file:
+          state: directory
+          path: "{{dirs.grafana_data}}"
+          owner: "{{_uid|string}}" # grafana container ids
+          group: "{{_gid|string}}"
+
+      - name: Starting container for service Grafana
+        docker_container:
+          name: grafana
+          hostname: grafana
+          image: "{{images.grafana}}"
+          labels: "{{container_lbls|combine(docker_band_lbls, _caddy_container_lbls)}}"
+          networks: [ { name: "{{docker_net_name}}" } ]
+          etc_hosts: "{{etc_hosts}}"
+          restart_policy: "{{_restart_policy}}"
+          pull: yes
+          restart: yes
+          recreate: yes
+          memory: "300m"
+          ports:
+            - "{{if_inner}}:{{ports.grafana.0}}:{{ports.grafana.1}}"
+          volumes:
+            - '{{dirs.grafana_data}}:/var/lib/grafana'
+      vars:
+        # labels: "{{container_lbls|combine(docker_band_lbls, _caddy_container_lbls)}}"
+        container_lbls:
+          "caddy.address": "grafana.{{_domain}}"
+          "caddy.targetport": "{{ports.grafana.1}}"
+          "caddy.proxy.header_upstream": "X-WEBAUTH-USER admin"
+          
+      tags: ['never', 'grafana', 'platform', 'pservice', 'docker-container', 'full']
+
+
+    ##### ##### ##### ##### #####    Theia    ##### ##### ##### ##### ##### 
+    - block:
+
+      - name: Fix workspace permissions
+        command: "chown -R {{_uid}}:{{_gid}} {{dirs.workspace}}"
+        args:
+          warn: False
+      
+      - name: Starting container for service Theia
+        docker_container:
+          name: theia
+          hostname: theia
+          image: "{{images.theia}}"
+          labels: "{{container_lbls|combine(docker_band_lbls, _caddy_container_lbls)}}"
+          ports: [ "{{if_inner}}:{{ports.theia.0}}:{{ports.theia.1}}" ]
+          networks: [ { name: "{{docker_net_name}}" } ]
+          etc_hosts: "{{etc_hosts}}"
+          env: "{{ container_env }}"
+          restart_policy: "{{_restart_policy}}"
+          pull: yes
+          restart: yes
+          recreate: yes
+          memory: "1g"
+          volumes:
+            - "{{dirs.workspace}}:{{project_dir}}:cached"
+            - "{{dirs.user_images}}:{{project_dir}}/images:cached"
+            - "{{dirs.user_libraries}}:{{project_dir}}/libraries:cached"
+            - "{{dirs.public}}:{{project_dir}}/public:cached"
+            - "{{dirs.shared}}:{{project_dir}}/shared:cached"
+            - "{{dirs.notebooks}}:{{project_dir}}/notebooks:cached"
+            - "{{dirs.chwriter_custom_migrations}}:{{project_dir}}/config/migrations:cached"
+            - "{{dirs.band_set}}:{{project_dir}}/sources_ro/band_set:ro"
+            - "{{dirs.band_set}}/__skeletons:{{project_dir}}/sources_ro/skeletons:ro"
+            - "{{dirs.chwriter_custom_config}}:{{custom_config_dir}}/chwriter:cached"
+            - "{{dirs.front_custom_config}}:{{custom_config_dir}}/front:cached"
+            - "{{dirs.environments}}:{{config_dir}}/environments:cached"
+      vars:
+        # labels: "{{container_lbls|combine(docker_band_lbls, _caddy_container_lbls)}}"
+        container_lbls:
+          "caddy.address": "theia.{{_domain}}"
+          "caddy.targetport": "{{ports.theia.1}}"
+
+        project_dir: /home/theia/project
+        config_dir: "{{project_dir}}/config"
+        custom_config_dir: "{{config_dir}}/custom"
+        service: theia
+      when: 'setup_theia == True'
+      tags: ['theia', 'platform', 'pservice', 'band', 'docker-container', 'full']
+
+
+    ##### ##### ##### ##### #####    VPN Server    ##### ##### ##### ##### ##### 
+
+
+    # - import_tasks: tasks/setup_vpn_server.yml
+      # tags: ['never', 'ovpn-server']
+
+
+    ##### ##### ##### ##### #####    Custom tasks    ##### ##### ##### ##### ##### 
+
+    - import_tasks: tasks/custom.yml
+      tags: ['full']
+
+    ##### ##### ##### ##### #####    Fake Shop    ##### ##### ##### ##### ##### 
+
+
+    - block:
+      - name: Starting container for service Fake-Shop
+        docker_container:
+          name: "{{service}}"
+          hostname: "{{service}}"
+          image: "{{images[service]}}"
+          labels: "{{ labels|combine(docker_band_lbls, _caddy_container_lbls)}}"
+          env: "{{container_env}}"
+          restart_policy: "{{_restart_policy}}"
+          pull: yes
+          restart: yes
+          memory: "50m"
+          ports:
+            - "{{if_inner}}:{{ports[service].0}}:{{ports[service].1}}"
+      vars:
+        service: fakeshop
+        service_addr: 
+        labels:
+          caddy.address: "demo.{{_domain}}"
+          caddy.targetport: "{{ ports[service].1 }}"
+      tags: ['never', 'fakeshop', 'platform', 'pservice', 'docker-container', 'full']
+
+    - docker_container: name=ebaloger state=absent
+      tags: ['never', 'ebaloger', 'system', 'platform', 'pservice', 'docker-container', 'full']
+
+    - docker_container: name=ebaloger state=absent
+      tags: ['never', 'httpdebug', 'system', 'full']

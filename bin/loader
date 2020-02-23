@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+
+if test -t 1; then # if terminal
+    ncolors=$(which tput > /dev/null && tput colors) # supports color
+    if test -n "$ncolors" && test $ncolors -ge 8; then
+        termcols=$(tput cols)
+        bold="$(tput bold)"
+        underline="$(tput smul)"
+        standout="$(tput smso)"
+        normal="$(tput sgr0)"
+        black="$(tput setaf 0)"
+        red="$(tput setaf 1)"
+        green="$(tput setaf 2)"
+        yellow="$(tput setaf 3)"
+        blue="$(tput setaf 4)"
+        magenta="$(tput setaf 5)"
+        cyan="$(tput setaf 6)"
+        white="$(tput setaf 7)"
+    fi
+fi
+
+base_print() {
+    echo -e "\n$1\n"
+}
+
+print_status() {
+  base_print "${cyan}${bold}>> ${blue}${1}${normal}"
+}
+
+print_pref() {
+  base_print "${yellow}${bold}!> ${normal}${1}"
+}
+
+print_pref "##"
+print_pref "##"
+print_pref "##"
+print_pref "## Current installer is deprecated."

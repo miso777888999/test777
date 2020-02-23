@@ -1,0 +1,19 @@
+
+- import_role:
+    name: dr.openvpn-server
+  vars:
+    openvpn_port: "{{ports.openvpn.0}}"
+    openvpn_clients: 5
+    openvpn_comp_lz4: yes
+    openvpn_clients_net: "{{s2s_vpn_net}}"
+    openvpn_push:
+      - "route {{docker_net_net}} {{docker_netmask}}"
+  tags: ['openvpn']
+
+# - import_role:
+#     name: dr.openvpn-client
+#   vars:
+#     openvpnc_key: '{{s2s_vpn_key}}'
+#   when: s2s_vpn_connect is defined and s2s_vpn_connect == True and vpn_id is defined
+#   tags: ['s2s-ovpn-client', 's2s-ovpn']
+
